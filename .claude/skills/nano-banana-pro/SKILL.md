@@ -2,24 +2,62 @@
 name: nano-banana-pro
 description: |
   Skill for image generation.
-  Uses Google Nano Banana Pro (Gemini 3 Pro Image) API to generate high-quality images.
+  Uses Google Nano Banana Pro (Gemini 3 Pro Image) API with multi-channel fallback.
+  Automatically falls back across AI Studio -> Vertex AI (Service Account) -> 柏拉图 bltcy middleman
+  so single-channel outages (e.g., GCP billing suspend) don't stop generation.
   Supports logos, infographics, illustrations, photorealistic images, and more.
 ---
 
-# Nano Banana Pro Image Generation Skill
+# Nano Banana Pro Image Generation Skill (Multi-Channel Fork)
 
 ## Overview
 
 This skill uses the Google Nano Banana Pro API to generate images.
 Use this skill when users need image generation.
 
+**Fork enhancement**: this version (`RexGrey/ccskill-nanobanana` branch
+`enhancement/multi-channel`) adds a three-channel fallback chain:
+
+1. **AI Studio** (default first, cheapest)
+2. **Vertex AI Service Account** (billing-independent fallback)
+3. **柏拉图 bltcy.ai middleman** (safety net)
+
+Transient errors (429, 5xx, billing suspend) fall back automatically.
+Permanent errors (400 bad prompt) abort the chain.
+
 ## Prerequisites
 
-- Set the environment variable `CCSKILL_NANOBANANA_DIR` to the path of this skill's repository
-  ```bash
-  export CCSKILL_NANOBANANA_DIR="$HOME/projects/ccskill-nanobanana"
-  ```
-- The environment variable `GEMINI_API_KEY` must be set (or specified in `$CCSKILL_NANOBANANA_DIR/.env`)
+### 1. Clone the fork
+
+```bash
+export CCSKILL_NANOBANANA_DIR="$HOME/projects/ccskill-nanobanana"
+git clone -b enhancement/multi-channel https://github.com/RexGrey/ccskill-nanobanana.git $CCSKILL_NANOBANANA_DIR
+cd $CCSKILL_NANOBANANA_DIR
+python3 -m venv venv
+venv/bin/pip install -r requirements.txt
+```
+
+### 2. Configure credentials (at least ONE channel needed)
+
+The skill loads credentials from (in priority order):
+
+**Priority 1 — ComfyUI Batchbox `secrets.yaml`** (recommended if you already use it):
+
+If `~/Documents/ComfyUI/custom_nodes/ComfyUI-Custom-Batchbox/secrets.yaml` exists,
+the skill will automatically read AI Studio keys, Vertex SA JSON, and 柏拉图 keys
+from it. No extra config needed. Override the path with `CCSKILL_SECRETS_YAML` env.
+
+**Priority 2 — Skill directory `.env`** (standalone use):
+
+```bash
+cp $CCSKILL_NANOBANANA_DIR/.env.example $CCSKILL_NANOBANANA_DIR/.env
+# Then edit .env and set at least one of:
+#   GEMINI_API_KEY=...             # AI Studio
+#   VERTEX_SA_JSON_PATH=...        # Vertex AI SA
+#   BLTCY_API_KEY=sk-...           # bltcy middleman
+```
+
+**Priority 3 — Process environment variables** (for CI / containers).
 
 ## Usage
 
@@ -35,6 +73,9 @@ $CCSKILL_NANOBANANA_DIR/venv/bin/python $CCSKILL_NANOBANANA_DIR/generate_image.p
 - `--aspect`: Aspect ratio (1:1, 16:9, 9:16, 4:3, etc.) Default: 16:9
 - `--output`: Output directory Default: ./generated_images
 - `--reference`: Reference image path (multiple allowed, up to 14)
+- `--provider ai_studio,vertex_sa,bltcy`: override chain priority order
+- `--only-provider vertex_sa`: single-channel test mode (no fallback)
+- `--debug`: show credential source + provider chain + fallback trace
 
 ### Examples
 
