@@ -1,8 +1,10 @@
 # Nano Banana Pro Image Generation Skill
 
-[日本語版 README](README.ja.md)
+[日本語版 README](README.ja.md) | **RexGrey Fork** — multi-channel fallback (AI Studio → Vertex SA → 柏拉图). See [Multi-Channel Fork Changes](#multi-channel-fork-changes).
 
 A Claude Code skill for image generation using the Google Nano Banana Pro (Gemini 3 Pro Image) API. Can also be used as a standalone image generation script.
+
+> **This fork adds three fallback channels** so the skill survives GCP billing suspends, rate limits, and transient outages. Drop-in compatible with upstream — `python generate_image.py "prompt"` still works exactly as before. See [Multi-Channel Fork Changes](#multi-channel-fork-changes) below for the new flags and config options.
 
 ## Setup
 
@@ -155,6 +157,89 @@ python -m pytest tests/ -v
 - **Output format**: Automatically determined from API response (PNG/JPEG/WebP)
 - **Filename**: Timestamp format (e.g., `20251130_153045.png`, `20251130_153045.jpg`)
 - **Watermark**: Generated images include SynthID
+
+## Multi-Channel Fork Changes
+
+This fork (`RexGrey/ccskill-nanobanana`, branch `enhancement/multi-channel`) adds resilience against single-point failures:
+
+### Why
+
+Upstream depends on a single `GEMINI_API_KEY` hitting AI Studio. If Google suspends the project (billing lapse, region restriction, etc.), every generation fails with:
+
+> `"Your project has been denied access. Please contact support."`
+
+This error is **often temporary** (billing suspend that auto-recovers after payment) but the single-channel design turns it into total outage. This fork adds two fallback channels and a billing-aware error classifier.
+
+### Three Channels
+
+| Channel | Auth | When it wins | Cost |
+|---------|------|--------------|------|
+| `ai_studio` (default first) | `GEMINI_API_KEY` URL param | Healthy days — cheapest, fastest | low |
+| `vertex_sa` | Service Account JSON (OAuth2) | AI Studio suspended — Vertex runs on a separate account system | low |
+| `bltcy` | Middleman `sk-xxx` key | Both Google channels down — proxy uses its own account pool | medium |
+
+The chain tries providers in order; falls back on transient errors (429, 5xx, "denied access" billing suspend); aborts on permanent errors (400 bad prompt).
+
+### New CLI flags
+
+```bash
+# Override chain priority
+python generate_image.py "prompt" --provider vertex_sa,ai_studio,bltcy
+
+# Run a single channel only (no fallback — useful for testing)
+python generate_image.py "prompt" --only-provider vertex_sa
+
+# Debug: show credential source + chain + fallback trace
+python generate_image.py "prompt" --debug
+```
+
+### New credential sources
+
+The fork loads credentials from **three places**, in priority order:
+
+1. **ComfyUI Batchbox `secrets.yaml`** — if you already use [ComfyUI-Custom-Batchbox](https://github.com/RexGrey/ComfyUI-Custom-Batchbox), this skill reads its `secrets.yaml` automatically (default path `~/Documents/ComfyUI/custom_nodes/ComfyUI-Custom-Batchbox/secrets.yaml`; override with `CCSKILL_SECRETS_YAML` env). No duplicate key setup needed.
+2. **Skill directory `.env`** — backward compatible with upstream.
+3. **Process environment variables** — for CI / container use.
+
+See [.env.example](.env.example) for all supported variables.
+
+### Architecture
+
+```
+generate_image.py  (CLI + dispatcher)
+    ├── config/loader.py        # secrets.yaml + .env + env vars → Credentials dataclass
+    ├── auth/sa_token.py        # Service Account JWT → OAuth2 Bearer token (cached)
+    └── providers/
+        ├── base.py             # Abstract Provider + error taxonomy (Transient/Permanent)
+        ├── ai_studio.py        # REST call to generativelanguage.googleapis.com
+        ├── vertex_sa.py        # REST call to aiplatform.googleapis.com with SA token
+        └── bltcy.py            # OpenAI-compat call to api.bltcy.ai + URL download
+```
+
+All providers return raw `bytes` + MIME type — no dependence on `google-genai` SDK for the new code paths (upstream's SDK usage is retained in `requirements.txt` for compatibility).
+
+### Billing-aware error handling
+
+On `"project has been denied access"`:
+- Classified as **transient** (not permanent) — the chain falls back to the next provider
+- Final error message hints `"check GCP billing status"` instead of misleading `"account banned"`
+
+### Diagnostic output
+
+```bash
+$ python generate_image.py "apple" --debug
+[debug] credentials: source=secrets.yaml:/.../secrets.yaml + .env+env ai_studio_keys=4 vertex_sa=inline vertex_project=batchbox bltcy_keys=2
+[debug] provider chain: ['ai_studio', 'vertex_sa', 'bltcy']
+[chain] trying provider: ai_studio
+[chain] ✅ success via ai_studio
+[Success] Image saved: ./generated_images/20260420_154350.jpg  (via ai_studio, 487KB)
+```
+
+### Upstream relationship
+
+- `main` tracks `feedtailor/ccskill-nanobanana@main` for easy merging
+- Multi-channel code lives on `enhancement/multi-channel`
+- No upstream file is deleted or structurally changed — additions only. Merging upstream changes should be low-conflict.
 
 ## License
 

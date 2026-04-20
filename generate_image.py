@@ -1,38 +1,56 @@
 #!/usr/bin/env python3
 """
-Nano Banana Pro 画像生成スクリプト
+Nano Banana Pro image generation — multi-channel edition.
 
-Google Gemini 3 Pro Image (Nano Banana Pro) APIを使用して画像を生成します。
+Generates images via Google Gemini 3 Pro Image Preview with automatic
+fallback across three channels:
+  1. AI Studio (direct, cheapest)
+  2. Vertex AI Service Account (billing-independent)
+  3. 柏拉图 bltcy.ai middleman (safety net)
 
-使用方法:
-    python generate_image.py "プロンプト" [--resolution 2K] [--aspect 1:1] [--output ./generated_images]
-    python generate_image.py "背景を変更" --reference original.png
+Usage:
+    python generate_image.py "prompt" [--resolution 2K] [--aspect 16:9]
+                                      [--output ./generated_images]
+                                      [--reference img.png]
+                                      [--provider ai_studio,vertex_sa]
+                                      [--only-provider vertex_sa]
+                                      [--debug]
 
-環境変数:
-    GEMINI_API_KEY: Google AI Studio で取得したAPIキー
-    （.env ファイルに記載可能）
+Credentials (priority order):
+  1. ComfyUI Batchbox secrets.yaml
+     (default: ~/Documents/ComfyUI/custom_nodes/ComfyUI-Custom-Batchbox/secrets.yaml
+      or override with CCSKILL_SECRETS_YAML env)
+  2. Skill directory .env (backward compatible with upstream)
+  3. Process environment variables (GEMINI_API_KEY, VERTEX_SA_JSON_PATH, BLTCY_API_KEY)
 """
+
+from __future__ import annotations
 
 import argparse
 import sys
 from datetime import datetime
 from pathlib import Path
 
-from dotenv import load_dotenv
-from google import genai
-from google.genai import types
-from PIL import Image
+# Ensure sibling modules (config/, auth/, providers/) are importable
+_SCRIPT_DIR = Path(__file__).parent.resolve()
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
 
-# このスクリプトと同じディレクトリの .env を読み込む
-_script_dir = Path(__file__).parent
-load_dotenv(_script_dir / ".env")
+from config.loader import describe, load_credentials  # noqa: E402
+from providers import (  # noqa: E402
+    PermanentError,
+    ProviderError,
+    TransientError,
+    build_provider_chain,
+    generate_with_fallback,
+)
 
-# デフォルト値
+# Defaults (backward compatible with upstream)
 DEFAULT_RESOLUTION = "2K"
 DEFAULT_ASPECT_RATIO = "16:9"
 DEFAULT_OUTPUT_DIR = "./generated_images"
+DEFAULT_PROVIDER_ORDER = "ai_studio,vertex_sa,bltcy"
 
-# MIMEタイプから拡張子へのマッピング
 MIME_TO_EXT = {
     "image/png": ".png",
     "image/jpeg": ".jpg",
@@ -41,148 +59,120 @@ MIME_TO_EXT = {
 
 
 def parse_args(args: list[str] | None = None) -> argparse.Namespace:
-    """コマンドライン引数をパースする"""
     parser = argparse.ArgumentParser(
-        description="Nano Banana Pro APIで画像を生成します"
+        description="Generate images via Nano Banana Pro with multi-channel fallback"
     )
+    parser.add_argument("prompt", type=str, help="Image generation prompt")
     parser.add_argument(
-        "prompt",
-        type=str,
-        help="画像生成のプロンプト"
-    )
-    parser.add_argument(
-        "--resolution",
-        type=str,
-        default=DEFAULT_RESOLUTION,
+        "--resolution", type=str, default=DEFAULT_RESOLUTION,
         choices=["1K", "2K", "4K"],
-        help=f"出力解像度 (デフォルト: {DEFAULT_RESOLUTION})"
+        help=f"Output resolution (default: {DEFAULT_RESOLUTION})",
     )
     parser.add_argument(
-        "--aspect",
-        type=str,
-        default=DEFAULT_ASPECT_RATIO,
-        help=f"アスペクト比 (デフォルト: {DEFAULT_ASPECT_RATIO})"
+        "--aspect", type=str, default=DEFAULT_ASPECT_RATIO,
+        help=f"Aspect ratio (default: {DEFAULT_ASPECT_RATIO})",
     )
     parser.add_argument(
-        "--output",
-        type=str,
-        default=DEFAULT_OUTPUT_DIR,
-        help=f"出力ディレクトリ (デフォルト: {DEFAULT_OUTPUT_DIR})"
+        "--output", type=str, default=DEFAULT_OUTPUT_DIR,
+        help=f"Output directory (default: {DEFAULT_OUTPUT_DIR})",
     )
     parser.add_argument(
-        "--reference",
-        type=str,
-        action="append",
-        default=[],
-        help="参照画像のパス（複数指定可能、最大14枚）"
+        "--reference", type=str, action="append", default=[],
+        help="Reference image path (repeatable, max 14)",
+    )
+    parser.add_argument(
+        "--provider", type=str, default=DEFAULT_PROVIDER_ORDER,
+        help=("Comma-separated provider priority order "
+              f"(default: {DEFAULT_PROVIDER_ORDER})"),
+    )
+    parser.add_argument(
+        "--only-provider", type=str, default=None,
+        help="Use only one provider (no fallback). Overrides --provider.",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Show credential source + provider chain + fallback trace",
     )
     return parser.parse_args(args)
 
 
 def get_output_path(output_dir: str, mime_type: str = "image/png") -> Path:
-    """出力ファイルパスを生成する"""
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    # タイムスタンプ形式のファイル名
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     ext = MIME_TO_EXT.get(mime_type, ".png")
-    return output_path / f"{timestamp}{ext}"
+    return out / f"{ts}{ext}"
 
 
-def generate_image(
-    prompt: str,
-    resolution: str,
-    aspect_ratio: str,
-    output_dir: str,
-    reference_images: list[str] | None = None
-) -> str | None:
-    """
-    Nano Banana Pro APIで画像を生成する
-
-    Args:
-        prompt: 画像生成のプロンプト
-        resolution: 出力解像度 (1K, 2K, 4K)
-        aspect_ratio: アスペクト比 (例: 1:1, 16:9)
-        output_dir: 出力ディレクトリ
-        reference_images: 参照画像のパスリスト（最大14枚）
-
-    Returns:
-        生成された画像のファイルパス、失敗時はNone
-    """
-    # 参照画像の存在確認
-    if reference_images:
-        for image_path in reference_images:
-            if not Path(image_path).exists():
-                print(f"[Error] 参照画像が見つかりません: {image_path}")
-                return None
-
-    client = genai.Client()
-
-    # コンテンツの構築
-    if reference_images:
-        # 参照画像がある場合はリストで渡す
-        contents: list = []
-        for image_path in reference_images:
-            img = Image.open(image_path)
-            contents.append(img)
-        contents.append(prompt)
-    else:
-        # 参照画像がない場合はプロンプトのみ
-        contents = prompt
-
-    response = client.models.generate_content(
-        model="gemini-3-pro-image-preview",
-        contents=contents,
-        config=types.GenerateContentConfig(
-            response_modalities=["TEXT", "IMAGE"],
-            image_config=types.ImageConfig(
-                aspect_ratio=aspect_ratio,
-                image_size=resolution
-            )
-        )
-    )
-
-    # レスポンスから画像を取得して保存
-    for part in response.parts:
-        if part.text is not None:
-            print(f"[Info] {part.text}")
-        elif part.inline_data is not None:
-            # APIが返す画像の実際のMIMEタイプを検出
-            mime_type = part.inline_data.mime_type or "image/png"
-            image = part.as_image()
-            output_path = get_output_path(output_dir, mime_type)
-            image.save(str(output_path))
-            print(f"[Success] 画像を保存しました: {output_path}")
-            return str(output_path)
-
-    print("[Warning] レスポンスに画像が含まれていませんでした")
-    return None
-
-
-def main():
-    """メイン関数"""
+def main() -> int:
     args = parse_args()
 
-    # 参照画像の数をチェック
     if args.reference and len(args.reference) > 14:
-        print("[Error] 参照画像は最大14枚までです")
-        sys.exit(1)
+        print("[Error] Max 14 reference images", file=sys.stderr)
+        return 1
+
+    creds = load_credentials(skill_dir=_SCRIPT_DIR)
+    if args.debug:
+        print(f"[debug] credentials: {describe(creds)}")
+
+    # Build provider chain
+    if args.only_provider:
+        order = [args.only_provider.strip()]
+    else:
+        order = [p.strip() for p in args.provider.split(",") if p.strip()]
+
+    chain = build_provider_chain(creds, order=order)
+    if args.debug or not chain:
+        print(f"[debug] provider chain: {[p.name for p in chain]}")
+
+    if not chain:
+        print(
+            "[Error] No providers available. Please configure at least one of:\n"
+            "  - GEMINI_API_KEY (AI Studio)\n"
+            "  - Vertex SA JSON (via secrets.yaml gcs.credentials or VERTEX_SA_JSON_PATH env)\n"
+            "  - BLTCY_API_KEY (柏拉图 middleman)",
+            file=sys.stderr,
+        )
+        return 1
 
     try:
-        result = generate_image(
+        result = generate_with_fallback(
+            providers=chain,
             prompt=args.prompt,
             resolution=args.resolution,
             aspect_ratio=args.aspect,
-            output_dir=args.output,
-            reference_images=args.reference if args.reference else None
+            reference_image_paths=args.reference or None,
+            verbose=args.debug,
         )
-        if result is None:
-            sys.exit(1)
+    except PermanentError as e:
+        print(f"[Error] Permanent failure from {e.provider}: {e}", file=sys.stderr)
+        return 2
+    except TransientError as e:
+        msg = str(e)
+        print(f"[Error] All providers failed: {msg}", file=sys.stderr)
+        if "denied access" in msg.lower():
+            print(
+                "[Hint] This usually means GCP billing is suspended. "
+                "Check https://console.cloud.google.com/billing",
+                file=sys.stderr,
+            )
+        return 3
+    except ProviderError as e:
+        print(f"[Error] Provider error: {e}", file=sys.stderr)
+        return 3
     except Exception as e:
-        print(f"[Error] 画像生成に失敗しました: {e}")
-        sys.exit(1)
+        print(f"[Error] Unexpected: {type(e).__name__}: {e}", file=sys.stderr)
+        return 4
+
+    if result.text:
+        print(f"[Info] {result.text}")
+
+    output_path = get_output_path(args.output, result.mime_type)
+    output_path.write_bytes(result.image_bytes)
+    print(f"[Success] Image saved: {output_path}  "
+          f"(via {result.provider}, {len(result.image_bytes)//1024}KB)")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
