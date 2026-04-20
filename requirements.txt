@@ -1,4 +1,14 @@
+# Core HTTP + config
+requests>=2.28.0
+python-dotenv>=1.0.0
+PyYAML>=6.0
+
+# Vertex AI Service Account authentication
+google-auth>=2.0.0
+
+# Retained for backward compatibility (upstream usage + optional PIL-based pipelines)
 google-genai>=1.52.0
 Pillow>=10.0.0
-python-dotenv>=1.0.0
+
+# Test
 pytest>=8.0.0
