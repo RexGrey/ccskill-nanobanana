@@ -82,6 +82,13 @@ def classify_google_error(status_code: int | None, message: str) -> type[Provide
       `"Your project has been denied access. Please contact support."` with 403/400
       can mean EITHER permanent denial OR temporary billing suspension. We classify
       as Transient so the chain falls back; the reporter then suggests billing check.
+
+    Invalid-API-key note:
+      `"API key not valid"` / `"API_KEY_INVALID"` etc. arrive as 400 INVALID_ARGUMENT
+      but are auth-layer failures (rotated key, wrong project, expired). They are
+      recoverable by trying another key (ai_studio has a key pool) or another
+      provider (vertex_sa / bltcy). Classify as Transient so the pool loop and the
+      provider chain can both fall back.
     """
     msg_lower = (message or "").lower()
 
@@ -89,6 +96,12 @@ def classify_google_error(status_code: int | None, message: str) -> type[Provide
     if "project has been denied access" in msg_lower:
         return TransientError
     if "billing" in msg_lower and ("disabled" in msg_lower or "required" in msg_lower):
+        return TransientError
+
+    # Invalid / expired API key → Transient (try next key or next provider)
+    if "api key not valid" in msg_lower or "api_key_invalid" in msg_lower:
+        return TransientError
+    if "api key expired" in msg_lower or "invalid api key" in msg_lower:
         return TransientError
 
     if status_code is None:
